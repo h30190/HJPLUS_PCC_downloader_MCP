@@ -73,8 +73,10 @@ class PccDownloader {
                 }
             }
         }
-        // 關鍵字輸入（有明確 id="cname"）
-        await page.locator("#cname").fill(keyword);
+        // 關鍵字輸入
+        // 頁面上有兩個搜尋欄位：右上角全站搜尋 + 表單內關鍵字欄位
+        // 用 input#cname.form-control 經進一步限縮，確保命中的是表單內的關鍵字欄位
+        await page.locator("input#cname.form-control").fill(keyword);
         // 點擊查詢按鈕
         await page.locator('button[aria-label="查詢"]').click();
         // 等待 loading 遮罩消失（嘗試多種常見 selector）
