@@ -46,8 +46,9 @@ class PccDownloader {
         const labels = Array.from(document.querySelectorAll('label:has(input[type="radio"])'));
         return labels.map(label => {
           const input = label.querySelector('input') as HTMLInputElement;
+          const htmlLabel = label as HTMLElement;
           return {
-            name: label.innerText.trim(),
+            name: htmlLabel.innerText.trim(),
             value: input.value
           };
         }).filter(c => c.name !== "");
@@ -112,7 +113,7 @@ class PccDownloader {
     }
   }
 
-  async batchDownload(items: { keyword?: string, code?: string, chapter?: string, formats: string[] }[]) {
+  async batchDownload(items: { keyword?: string | undefined, code?: string | undefined, chapter?: string | undefined, formats: string[] }[]) {
     const results: { item: string, status: string, files: string[], error?: string }[] = [];
     const page = await this.getPage();
 

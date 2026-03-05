@@ -29,27 +29,44 @@ class PccDownloader {
         const context = await this.browser.newContext();
         return await context.newPage();
     }
-    async search(keyword, chapter) {
+    async listChapters() {
         const page = await this.getPage();
         try {
             await page.goto(this.url, { waitUntil: "networkidle" });
-            // Handle chapter selection
+            const chapters = await page.evaluate(() => {
+                const labels = Array.from(document.querySelectorAll('label:has(input[type="radio"])'));
+                return labels.map(label => {
+                    const input = label.querySelector('input');
+                    const htmlLabel = label;
+                    return {
+                        name: htmlLabel.innerText.trim(),
+                        value: input.value
+                    };
+                }).filter(c => c.name !== "");
+            });
+            return chapters;
+        }
+        finally {
+            await page.close();
+        }
+    }
+    async search(keyword = "", chapter) {
+        const page = await this.getPage();
+        try {
+            await page.goto(this.url, { waitUntil: "networkidle" });
             if (chapter) {
-                // Find the radio button by value
                 const radio = page.locator(`input[type="radio"][value="${chapter}"]`);
                 if (await radio.count() > 0) {
                     await radio.check();
                 }
             }
-            // Handle keyword input
-            // The keyword input is usually inside a div/label "關鍵字："
-            const keywordInput = page.locator('input[type="text"]').first(); // Or more specific selector
+            const keywordInput = page.locator('input[type="text"]').first();
             await keywordInput.fill(keyword);
-            // Click search button
             const searchBtn = page.locator('button:has-text("查詢")');
             await searchBtn.click();
-            // Wait for results table to update
+            // Wait for table to update
             await page.waitForLoadState("networkidle");
+            await page.waitForTimeout(1000); // Small buffer for JS rendering
             // Wait for the list table - usually it's a table with class or inside a certain div
             // Based on typical JHipster/PCCES structure
             await page.waitForSelector("table", { timeout: 10000 }).catch(() => null);
@@ -76,6 +93,76 @@ class PccDownloader {
                 });
             });
             return rows;
+        }
+        finally {
+            await page.close();
+        }
+    }
+    async batchDownload(items) {
+        const results = [];
+        const page = await this.getPage();
+        try {
+            for (const item of items) {
+                const searchTerm = item.code || item.keyword || "";
+                const itemIdentifier = item.code ? `Code: ${item.code}` : `Keyword: ${item.keyword}`;
+                try {
+                    await page.goto(this.url, { waitUntil: "networkidle" });
+                    if (item.chapter) {
+                        const radio = page.locator(`input[type="radio"][value="${item.chapter}"]`);
+                        if (await radio.count() > 0)
+                            await radio.check();
+                    }
+                    await page.locator('input[type="text"]').first().fill(searchTerm);
+                    await page.locator('button:has-text("查詢")').click();
+                    await page.waitForLoadState("networkidle");
+                    await page.waitForTimeout(500);
+                    // Find the best matching row
+                    // If code is provided, try to match tds[1], else match by text in row
+                    let rowSelector = item.code ? `tr:has(td:text-is("${item.code}"))` : `tr:has-text("${item.keyword}")`;
+                    const row = page.locator(rowSelector).first();
+                    if (await row.count() === 0) {
+                        results.push({ item: itemIdentifier, status: "Failed", files: [], error: "Not found" });
+                        continue;
+                    }
+                    const downloadedFiles = [];
+                    for (const format of item.formats) {
+                        let selector = "";
+                        switch (format.toLowerCase()) {
+                            case "doc":
+                                selector = 'img[src*="doc"], a:has-text("DOC")';
+                                break;
+                            case "odt":
+                                selector = 'img[src*="odt"], a:has-text("ODT")';
+                                break;
+                            case "xls":
+                                selector = 'img[src*="xls"], a:has-text("XLS")';
+                                break;
+                            case "pdf":
+                                selector = 'img[src*="pdf"], a:has-text("PDF")';
+                                break;
+                        }
+                        const btn = row.locator(selector);
+                        if (await btn.count() > 0) {
+                            const [download] = await Promise.all([
+                                page.waitForEvent("download"),
+                                btn.click(),
+                            ]);
+                            const fileName = download.suggestedFilename();
+                            await download.saveAs(path.join(DOWNLOAD_DIR, fileName));
+                            downloadedFiles.push(fileName);
+                        }
+                    }
+                    results.push({
+                        item: itemIdentifier,
+                        status: downloadedFiles.length > 0 ? "Success" : "No formats found",
+                        files: downloadedFiles
+                    });
+                }
+                catch (e) {
+                    results.push({ item: itemIdentifier, status: "Error", files: [], error: e.message });
+                }
+            }
+            return results;
         }
         finally {
             await page.close();
@@ -145,19 +232,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
             {
+                name: "list_chapters",
+                description: "Get the list of all available chapter categories (e.g., 03 Concrete, 09 Finishes)",
+                inputSchema: {
+                    type: "object",
+                    properties: {},
+                },
+            },
+            {
                 name: "search_specifications",
-                description: "Search for construction specifications by keyword and chapter",
+                description: "Search for construction specifications. If keyword is empty, lists all in the chapter.",
                 inputSchema: {
                     type: "object",
                     properties: {
-                        keyword: { type: "string", description: "Keyword to search for" },
+                        keyword: { type: "string", description: "Keyword or specification code (e.g. 09910). Can be empty." },
                         chapter: {
                             type: "string",
-                            description: "Chapter code (00-16, L, E). Leave empty for all.",
+                            description: "Chapter code (00-16, L, E).",
                             enum: ["", "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "L", "E"]
                         },
                     },
-                    required: ["keyword"],
+                },
+            },
+            {
+                name: "batch_download_specifications",
+                description: "Download multiple specifications in one tool call. Best for automation.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        items: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    code: { type: "string", description: "Specification code (e.g. 09910)" },
+                                    keyword: { type: "string", description: "Keyword (used if code is not available)" },
+                                    chapter: { type: "string", description: "Chapter code (00-16, L, E)" },
+                                    formats: {
+                                        type: "array",
+                                        items: { type: "string", enum: ["doc", "odt", "xls", "pdf"] },
+                                        description: "List of formats to download"
+                                    }
+                                },
+                                required: ["formats"]
+                            }
+                        }
+                    },
+                    required: ["items"]
                 },
             },
             {
@@ -184,12 +305,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     try {
+        if (name === "list_chapters") {
+            const results = await pcc.listChapters();
+            return {
+                content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+            };
+        }
         if (name === "search_specifications") {
             const { keyword, chapter } = z.object({
                 keyword: z.string(),
                 chapter: z.string().optional(),
             }).parse(args);
             const results = await pcc.search(keyword, chapter);
+            return {
+                content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+            };
+        }
+        if (name === "batch_download_specifications") {
+            const { items } = z.object({
+                items: z.array(z.object({
+                    code: z.string().optional(),
+                    keyword: z.string().optional(),
+                    chapter: z.string().optional(),
+                    formats: z.array(z.string()),
+                }))
+            }).parse(args);
+            const results = await pcc.batchDownload(items);
             return {
                 content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
             };
