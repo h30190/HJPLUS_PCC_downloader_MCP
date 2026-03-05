@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DOWNLOAD_DIR = path.join(process.cwd(), "downloads");
+const DOWNLOAD_DIR = path.join(__dirname, "..", "downloads");
 
 // Ensure download directory exists
 if (!fs.existsSync(DOWNLOAD_DIR)) {
@@ -25,7 +25,12 @@ class PccDownloader {
   private url = "https://pcic.pcc.gov.tw/pwc-web/service/tec0304";
 
   async init() {
-    this.browser = await chromium.launch({ headless: true });
+    this.browser = await chromium.launch({
+      headless: true,
+      // 抑制 Playwright 的 stderr 輸出，避免污染 MCP stdio 通道
+      // 某些 agent host 會將 stderr 視為錯誤訊號
+      args: ["--disable-logging", "--log-level=3"],
+    });
   }
 
   async close() {
@@ -74,9 +79,11 @@ class PccDownloader {
       const keywordInput = page.locator('input[type="text"]').first();
       await keywordInput.fill(keyword);
 
-      const searchBtn = page.locator('button:has-text("查詢")');
+      const searchBtn = page.locator('button[aria-label="查詢"]').first();
+      // Wait for mask to hide
+      await page.locator('.mask-container').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => null);
       await searchBtn.click();
-      
+
       // Wait for table to update
       await page.waitForLoadState("networkidle");
       await page.waitForTimeout(1000); // Small buffer for JS rendering
@@ -98,11 +105,11 @@ class PccDownloader {
             code: tds[1]?.innerText?.trim() || "",
             name: tds[2]?.innerText?.trim() || "",
             version: tds[3]?.innerText?.trim() || "",
-            // Find download buttons/icons
-            hasDoc: !!tr.querySelector('img[src*="doc"], a:has-text("DOC")'),
-            hasOdt: !!tr.querySelector('img[src*="odt"], a:has-text("ODT")'),
-            hasXls: !!tr.querySelector('img[src*="xls"], a:has-text("XLS")'),
-            hasPdf: !!tr.querySelector('img[src*="pdf"], a:has-text("PDF")'),
+            // Find download buttons/icons using standard selectors
+            hasDoc: !!tr.querySelector('img[src*="doc"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('DOC')),
+            hasOdt: !!tr.querySelector('img[src*="odt"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('ODT')),
+            hasXls: !!tr.querySelector('img[src*="xls"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('XLS')),
+            hasPdf: !!tr.querySelector('img[src*="pdf"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('PDF')),
           };
         });
       });
@@ -121,15 +128,15 @@ class PccDownloader {
       for (const item of items) {
         const searchTerm = item.code || item.keyword || "";
         const itemIdentifier = item.code ? `Code: ${item.code}` : `Keyword: ${item.keyword}`;
-        
+
         try {
           await page.goto(this.url, { waitUntil: "networkidle" });
-          
+
           if (item.chapter) {
             const radio = page.locator(`input[type="radio"][value="${item.chapter}"]`);
             if (await radio.count() > 0) await radio.check();
           }
-          
+
           await page.locator('input[type="text"]').first().fill(searchTerm);
           await page.locator('button:has-text("查詢")').click();
           await page.waitForLoadState("networkidle");
@@ -167,10 +174,10 @@ class PccDownloader {
             }
           }
 
-          results.push({ 
-            item: itemIdentifier, 
-            status: downloadedFiles.length > 0 ? "Success" : "No formats found", 
-            files: downloadedFiles 
+          results.push({
+            item: itemIdentifier,
+            status: downloadedFiles.length > 0 ? "Success" : "No formats found",
+            files: downloadedFiles
           });
 
         } catch (e: any) {
@@ -265,8 +272,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             keyword: { type: "string", description: "Keyword or specification code (e.g. 09910). Can be empty." },
-            chapter: { 
-              type: "string", 
+            chapter: {
+              type: "string",
               description: "Chapter code (00-16, L, E).",
               enum: ["", "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "L", "E"]
             },
@@ -287,8 +294,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   code: { type: "string", description: "Specification code (e.g. 09910)" },
                   keyword: { type: "string", description: "Keyword (used if code is not available)" },
                   chapter: { type: "string", description: "Chapter code (00-16, L, E)" },
-                  formats: { 
-                    type: "array", 
+                  formats: {
+                    type: "array",
                     items: { type: "string", enum: ["doc", "odt", "xls", "pdf"] },
                     description: "List of formats to download"
                   }
@@ -309,8 +316,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             keyword: { type: "string", description: "Original keyword used for search" },
             chapter: { type: "string", description: "Chapter code used for search" },
             name: { type: "string", description: "Full name of the specification to download" },
-            format: { 
-              type: "string", 
+            format: {
+              type: "string",
               enum: ["doc", "odt", "xls", "pdf"],
               description: "File format to download"
             },
@@ -335,7 +342,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (name === "search_specifications") {
       const { keyword, chapter } = z.object({
-        keyword: z.string(),
+        keyword: z.string().optional().default(""),
         chapter: z.string().optional(),
       }).parse(args);
 
@@ -371,9 +378,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const result = await pcc.download(keyword, chapter, specName, format);
       return {
-        content: [{ 
-          type: "text", 
-          text: `Successfully downloaded: ${result.fileName}\nPath: ${result.filePath}` 
+        content: [{
+          type: "text",
+          text: `Successfully downloaded: ${result.fileName}\nPath: ${result.filePath}`
         }],
       };
     }
@@ -390,10 +397,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("PCC Downloader MCP Server running on stdio");
+  // 注意：不用 console.log，避免污染 MCP 的 stdout；
+  // console.error 寫入 stderr 理論上安全，但部分 agent 實作中建議完全靜默
+  // console.error("PCC Downloader MCP Server running on stdio");
 }
 
+const LOG_FILE = path.join(process.cwd(), "debug_error.log");
+function logError(err: any) {
+  const msg = `${new Date().toISOString()} - ${err instanceof Error ? err.stack : JSON.stringify(err)}\n`;
+  fs.appendFileSync(LOG_FILE, msg);
+}
+
+process.on("uncaughtException", (err) => {
+  logError(err);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (err) => {
+  logError(err);
+  process.exit(1);
+});
+
 main().catch((error) => {
-  console.error("Server error:", error);
+  logError(error);
   process.exit(1);
 });

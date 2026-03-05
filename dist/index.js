@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DOWNLOAD_DIR = path.join(process.cwd(), "downloads");
+const DOWNLOAD_DIR = path.join(__dirname, "..", "downloads");
 // Ensure download directory exists
 if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -17,7 +17,12 @@ class PccDownloader {
     browser = null;
     url = "https://pcic.pcc.gov.tw/pwc-web/service/tec0304";
     async init() {
-        this.browser = await chromium.launch({ headless: true });
+        this.browser = await chromium.launch({
+            headless: true,
+            // 抑制 Playwright 的 stderr 輸出，避免污染 MCP stdio 通道
+            // 某些 agent host 會將 stderr 視為錯誤訊號
+            args: ["--disable-logging", "--log-level=3"],
+        });
     }
     async close() {
         if (this.browser)
@@ -62,7 +67,9 @@ class PccDownloader {
             }
             const keywordInput = page.locator('input[type="text"]').first();
             await keywordInput.fill(keyword);
-            const searchBtn = page.locator('button:has-text("查詢")');
+            const searchBtn = page.locator('button[aria-label="查詢"]').first();
+            // Wait for mask to hide
+            await page.locator('.mask-container').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => null);
             await searchBtn.click();
             // Wait for table to update
             await page.waitForLoadState("networkidle");
@@ -84,11 +91,11 @@ class PccDownloader {
                         code: tds[1]?.innerText?.trim() || "",
                         name: tds[2]?.innerText?.trim() || "",
                         version: tds[3]?.innerText?.trim() || "",
-                        // Find download buttons/icons
-                        hasDoc: !!tr.querySelector('img[src*="doc"], a:has-text("DOC")'),
-                        hasOdt: !!tr.querySelector('img[src*="odt"], a:has-text("ODT")'),
-                        hasXls: !!tr.querySelector('img[src*="xls"], a:has-text("XLS")'),
-                        hasPdf: !!tr.querySelector('img[src*="pdf"], a:has-text("PDF")'),
+                        // Find download buttons/icons using standard selectors
+                        hasDoc: !!tr.querySelector('img[src*="doc"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('DOC')),
+                        hasOdt: !!tr.querySelector('img[src*="odt"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('ODT')),
+                        hasXls: !!tr.querySelector('img[src*="xls"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('XLS')),
+                        hasPdf: !!tr.querySelector('img[src*="pdf"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('PDF')),
                     };
                 });
             });
@@ -313,7 +320,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (name === "search_specifications") {
             const { keyword, chapter } = z.object({
-                keyword: z.string(),
+                keyword: z.string().optional().default(""),
                 chapter: z.string().optional(),
             }).parse(args);
             const results = await pcc.search(keyword, chapter);
@@ -362,10 +369,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("PCC Downloader MCP Server running on stdio");
+    // 注意：不用 console.log，避免污染 MCP 的 stdout；
+    // console.error 寫入 stderr 理論上安全，但部分 agent 實作中建議完全靜默
+    // console.error("PCC Downloader MCP Server running on stdio");
 }
+const LOG_FILE = path.join(process.cwd(), "debug_error.log");
+function logError(err) {
+    const msg = `${new Date().toISOString()} - ${err instanceof Error ? err.stack : JSON.stringify(err)}\n`;
+    fs.appendFileSync(LOG_FILE, msg);
+}
+process.on("uncaughtException", (err) => {
+    logError(err);
+    process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+    logError(err);
+    process.exit(1);
+});
 main().catch((error) => {
-    console.error("Server error:", error);
+    logError(error);
     process.exit(1);
 });
 //# sourceMappingURL=index.js.map
