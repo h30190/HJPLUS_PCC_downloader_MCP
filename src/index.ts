@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// 固定指向專案目錄下的 downloads，不受 agent 工作目錄影響
 const DOWNLOAD_DIR = path.join(__dirname, "..", "downloads");
 
 // Ensure download directory exists
@@ -43,20 +44,77 @@ class PccDownloader {
     return await context.newPage();
   }
 
+  /**
+   * 共用的搜尋流程：填入章節與關鍵字後點查詢，等待結果表格出現
+   *
+   * 實際 DOM 結構（由瀏覽器直接調查確認）：
+   *   - 章節選擇：<select id="tecCode">，值為 "" (全部) 或 "01"..."16","L","E"
+   *   - 關鍵字：<input id="cname">
+   *   - 查詢按鈕：<button aria-label="查詢">
+   *   - loading 遮罩：點擊查詢後出現「查詢中，請稍候...」overlay，需等待消失
+   *   - 結果表格：<tbody> 裡的 <tr>，預設不顯示，點查詢後才出現
+   */
+  private async searchAndWait(page: Page, keyword: string, chapter?: string) {
+    await page.goto(this.url, { waitUntil: "networkidle" });
+
+    // 章節選擇（實際是 <select>，非 radio button）
+    if (chapter) {
+      const select = page.locator("#tecCode");
+      if (await select.count() > 0) {
+        await select.selectOption(chapter);
+      }
+    }
+
+    // 關鍵字輸入（有明確 id="cname"）
+    await page.locator("#cname").fill(keyword);
+
+    // 點擊查詢按鈕
+    await page.locator('button[aria-label="查詢"]').click();
+
+    // 等待 loading 遮罩消失（嘗試多種常見 selector）
+    for (const maskSel of [".vld-overlay", ".loading-overlay", ".mask-container", "[class*='loading']"]) {
+      await page.locator(maskSel).waitFor({ state: "hidden", timeout: 3000 }).catch(() => null);
+    }
+
+    // 等待結果表格的 tbody tr 出現（比 networkidle 更精準）
+    await page.waitForSelector("table tbody tr", { timeout: 30000 }).catch(() => null);
+
+    // 額外緩衝（Vue reactive 渲染）
+    await page.waitForTimeout(500);
+  }
+
+  /**
+   * 取得下載按鈕的 Playwright selector
+   *
+   * 實際調查：下載按鈕是 <button class="btn btn-link"> 含有 "DOC版"、"ODT版"、"ODS版" 等文字
+   * 注意：ODS 是 OpenDocument Spreadsheet（XLS 的 open format 替代）
+   */
+  private getFormatSelector(format: string): string {
+    switch (format.toLowerCase()) {
+      case "doc": return 'button.btn-link:has-text("DOC版")';
+      case "odt": return 'button.btn-link:has-text("ODT版")';
+      case "xls": return 'button.btn-link:has-text("XLS版")';
+      case "ods": return 'button.btn-link:has-text("ODS版")';
+      case "pdf": return 'button.btn-link:has-text("PDF版")';
+      default: throw new Error(`不支援的格式: ${format}。支援: doc, odt, xls, ods, pdf`);
+    }
+  }
+
   async listChapters() {
     const page = await this.getPage();
     try {
       await page.goto(this.url, { waitUntil: "networkidle" });
+
+      // 章節是 <select id="tecCode">，讀取所有 <option>
       const chapters = await page.evaluate(() => {
-        const labels = Array.from(document.querySelectorAll('label:has(input[type="radio"])'));
-        return labels.map(label => {
-          const input = label.querySelector('input') as HTMLInputElement;
-          const htmlLabel = label as HTMLElement;
-          return {
-            name: htmlLabel.innerText.trim(),
-            value: input.value
-          };
-        }).filter(c => c.name !== "");
+        const select = document.querySelector<HTMLSelectElement>("#tecCode");
+        if (!select) return [];
+        return Array.from(select.options)
+          .filter(opt => opt.value !== "")
+          .map(opt => ({
+            name: opt.text.trim(),
+            value: opt.value,
+          }));
       });
       return chapters;
     } finally {
@@ -67,49 +125,35 @@ class PccDownloader {
   async search(keyword: string = "", chapter?: string) {
     const page = await this.getPage();
     try {
-      await page.goto(this.url, { waitUntil: "networkidle" });
+      await this.searchAndWait(page, keyword, chapter);
 
-      if (chapter) {
-        const radio = page.locator(`input[type="radio"][value="${chapter}"]`);
-        if (await radio.count() > 0) {
-          await radio.check();
-        }
-      }
-
-      const keywordInput = page.locator('input[type="text"]').first();
-      await keywordInput.fill(keyword);
-
-      const searchBtn = page.locator('button[aria-label="查詢"]').first();
-      // Wait for mask to hide
-      await page.locator('.mask-container').waitFor({ state: 'hidden', timeout: 5000 }).catch(() => null);
-      await searchBtn.click();
-
-      // Wait for table to update
-      await page.waitForLoadState("networkidle");
-      await page.waitForTimeout(1000); // Small buffer for JS rendering
-
-      // Wait for the list table - usually it's a table with class or inside a certain div
-      // Based on typical JHipster/PCCES structure
-      await page.waitForSelector("table", { timeout: 10000 }).catch(() => null);
-
-      // Extract table rows
+      // 結果表格欄位結構（實際調查確認）：
+      //   td[0] (nth-child 1) = 序號
+      //   td[1] (nth-child 2) = 章碼（如 01271）
+      //   td[2] (nth-child 3) = 章名（如 計量與計價）
+      //   td[3] (nth-child 4) = 完整版：版本號 + 下載按鈕 (button.btn-link: "DOC版", "ODT版")
+      //   td[4] (nth-child 5) = 細目版：版本號 + 下載按鈕
+      //   td[5] (nth-child 6) = 歷程按鈕
       const rows = await page.evaluate(() => {
         const table = document.querySelector("table");
         if (!table) return [];
         const trs = Array.from(table.querySelectorAll("tbody tr"));
         return trs.map((tr, index) => {
           const tds = Array.from(tr.querySelectorAll("td"));
-          // Typical columns: No., Chapter/Code, Name, Version, Download Icons
+          // 從所有 button.btn-link 的文字判斷可用格式
+          const allBtns = Array.from(tr.querySelectorAll("button.btn-link"));
+          const btnTexts = allBtns.map(b => (b as HTMLElement).innerText.trim().toUpperCase());
           return {
             index,
-            code: tds[1]?.innerText?.trim() || "",
-            name: tds[2]?.innerText?.trim() || "",
-            version: tds[3]?.innerText?.trim() || "",
-            // Find download buttons/icons using standard selectors
-            hasDoc: !!tr.querySelector('img[src*="doc"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('DOC')),
-            hasOdt: !!tr.querySelector('img[src*="odt"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('ODT')),
-            hasXls: !!tr.querySelector('img[src*="xls"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('XLS')),
-            hasPdf: !!tr.querySelector('img[src*="pdf"]') || Array.from(tr.querySelectorAll('a')).some(a => a.innerText.includes('PDF')),
+            code: (tds[1] as HTMLElement)?.innerText?.trim() || "",
+            name: (tds[2] as HTMLElement)?.innerText?.trim() || "",
+            fullVersion: (tds[3] as HTMLElement)?.innerText?.replace(/DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
+            detailVersion: (tds[4] as HTMLElement)?.innerText?.replace(/DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
+            hasDoc: btnTexts.some(t => t.includes("DOC")),
+            hasOdt: btnTexts.some(t => t.includes("ODT")),
+            hasXls: btnTexts.some(t => t.includes("XLS")),
+            hasOds: btnTexts.some(t => t.includes("ODS")),
+            hasPdf: btnTexts.some(t => t.includes("PDF")),
           };
         });
       });
@@ -130,22 +174,15 @@ class PccDownloader {
         const itemIdentifier = item.code ? `Code: ${item.code}` : `Keyword: ${item.keyword}`;
 
         try {
-          await page.goto(this.url, { waitUntil: "networkidle" });
+          await this.searchAndWait(page, searchTerm, item.chapter);
 
-          if (item.chapter) {
-            const radio = page.locator(`input[type="radio"][value="${item.chapter}"]`);
-            if (await radio.count() > 0) await radio.check();
+          // 透過章碼（td:nth-child(2)）精確比對，或章名模糊比對
+          let row;
+          if (item.code) {
+            row = page.locator(`table tbody tr:has(td:nth-child(2):text-is("${item.code}"))`).first();
+          } else {
+            row = page.locator(`table tbody tr:has-text("${item.keyword}")`).first();
           }
-
-          await page.locator('input[type="text"]').first().fill(searchTerm);
-          await page.locator('button:has-text("查詢")').click();
-          await page.waitForLoadState("networkidle");
-          await page.waitForTimeout(500);
-
-          // Find the best matching row
-          // If code is provided, try to match tds[1], else match by text in row
-          let rowSelector = item.code ? `tr:has(td:text-is("${item.code}"))` : `tr:has-text("${item.keyword}")`;
-          const row = page.locator(rowSelector).first();
 
           if (await row.count() === 0) {
             results.push({ item: itemIdentifier, status: "Failed", files: [], error: "Not found" });
@@ -154,15 +191,8 @@ class PccDownloader {
 
           const downloadedFiles: string[] = [];
           for (const format of item.formats) {
-            let selector = "";
-            switch (format.toLowerCase()) {
-              case "doc": selector = 'img[src*="doc"], a:has-text("DOC")'; break;
-              case "odt": selector = 'img[src*="odt"], a:has-text("ODT")'; break;
-              case "xls": selector = 'img[src*="xls"], a:has-text("XLS")'; break;
-              case "pdf": selector = 'img[src*="pdf"], a:has-text("PDF")'; break;
-            }
-
-            const btn = row.locator(selector);
+            const selector = this.getFormatSelector(format);
+            const btn = row.locator(selector).first();
             if (await btn.count() > 0) {
               const [download] = await Promise.all([
                 page.waitForEvent("download"),
@@ -193,37 +223,25 @@ class PccDownloader {
   async download(keyword: string, chapter: string, targetName: string, format: string) {
     const page = await this.getPage();
     try {
-      await page.goto(this.url, { waitUntil: "networkidle" });
+      await this.searchAndWait(page, keyword, chapter);
 
-      if (chapter) {
-        await page.locator(`input[type="radio"][value="${chapter}"]`).check();
-      }
-      await page.locator('input[type="text"]').first().fill(keyword);
-      await page.locator('button:has-text("查詢")').click();
-      await page.waitForLoadState("networkidle");
+      // 用章名（td:nth-child(3)）精確比對
+      let row = page.locator(`table tbody tr:has(td:nth-child(3):text-is("${targetName}"))`).first();
 
-      // Find the specific row by name
-      const row = page.locator(`tr:has-text("${targetName}")`).first();
+      // fallback：has-text 模糊比對（避免空白字元不一致導致比對失敗）
       if (await row.count() === 0) {
-        throw new Error(`Could not find specification named: ${targetName}`);
+        row = page.locator(`table tbody tr:has-text("${targetName}")`).first();
+        if (await row.count() === 0) {
+          throw new Error(`找不到規範: ${targetName}`);
+        }
       }
 
-      // Find the download button for the format
-      let selector = "";
-      switch (format.toLowerCase()) {
-        case "doc": selector = 'img[src*="doc"], a:has-text("DOC")'; break;
-        case "odt": selector = 'img[src*="odt"], a:has-text("ODT")'; break;
-        case "xls": selector = 'img[src*="xls"], a:has-text("XLS")'; break;
-        case "pdf": selector = 'img[src*="pdf"], a:has-text("PDF")'; break;
-        default: throw new Error(`Unsupported format: ${format}`);
-      }
-
-      const downloadBtn = row.locator(selector);
+      const selector = this.getFormatSelector(format);
+      const downloadBtn = row.locator(selector).first();
       if (await downloadBtn.count() === 0) {
-        throw new Error(`Format ${format} not available for ${targetName}`);
+        throw new Error(`規範 ${targetName} 沒有 ${format} 格式`);
       }
 
-      // Handle download event
       const [download] = await Promise.all([
         page.waitForEvent("download"),
         downloadBtn.click(),
@@ -259,7 +277,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "list_chapters",
-        description: "Get the list of all available chapter categories (e.g., 03 Concrete, 09 Finishes)",
+        description: "取得所有可用的章節分類清單（從網站的 select dropdown 動態讀取）",
         inputSchema: {
           type: "object",
           properties: {},
@@ -267,14 +285,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_specifications",
-        description: "Search for construction specifications. If keyword is empty, lists all in the chapter.",
+        description: "搜尋施工綱要規範。keyword 留空可列出該章節所有規範。",
         inputSchema: {
           type: "object",
           properties: {
-            keyword: { type: "string", description: "Keyword or specification code (e.g. 09910). Can be empty." },
+            keyword: { type: "string", description: "關鍵字或規範編號（如 09910）。可留空。" },
             chapter: {
               type: "string",
-              description: "Chapter code (00-16, L, E).",
+              description: "章節代碼（00-16, L, E）。留空表示全部章節。",
               enum: ["", "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "L", "E"]
             },
           },
@@ -282,7 +300,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "batch_download_specifications",
-        description: "Download multiple specifications in one tool call. Best for automation.",
+        description: "批次下載多個規範，一次 tool call 完成。適合自動化任務。",
         inputSchema: {
           type: "object",
           properties: {
@@ -291,13 +309,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: {
                 type: "object",
                 properties: {
-                  code: { type: "string", description: "Specification code (e.g. 09910)" },
-                  keyword: { type: "string", description: "Keyword (used if code is not available)" },
-                  chapter: { type: "string", description: "Chapter code (00-16, L, E)" },
+                  code: { type: "string", description: "規範章碼（如 09910）" },
+                  keyword: { type: "string", description: "關鍵字（無章碼時使用）" },
+                  chapter: { type: "string", description: "章節代碼（00-16, L, E）" },
                   formats: {
                     type: "array",
-                    items: { type: "string", enum: ["doc", "odt", "xls", "pdf"] },
-                    description: "List of formats to download"
+                    items: { type: "string", enum: ["doc", "odt", "xls", "ods", "pdf"] },
+                    description: "要下載的格式列表"
                   }
                 },
                 required: ["formats"]
@@ -309,17 +327,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "download_specification",
-        description: "Download a specific construction specification file",
+        description: "下載單一特定規範文件",
         inputSchema: {
           type: "object",
           properties: {
-            keyword: { type: "string", description: "Original keyword used for search" },
-            chapter: { type: "string", description: "Chapter code used for search" },
-            name: { type: "string", description: "Full name of the specification to download" },
+            keyword: { type: "string", description: "搜尋用的關鍵字" },
+            chapter: { type: "string", description: "搜尋用的章節代碼" },
+            name: { type: "string", description: "要下載的規範完整章名" },
             format: {
               type: "string",
-              enum: ["doc", "odt", "xls", "pdf"],
-              description: "File format to download"
+              enum: ["doc", "odt", "xls", "ods", "pdf"],
+              description: "要下載的格式"
             },
           },
           required: ["keyword", "chapter", "name", "format"],
@@ -380,7 +398,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return {
         content: [{
           type: "text",
-          text: `Successfully downloaded: ${result.fileName}\nPath: ${result.filePath}`
+          text: `成功下載: ${result.fileName}\n路徑: ${result.filePath}`
         }],
       };
     }
@@ -402,7 +420,7 @@ async function main() {
   // console.error("PCC Downloader MCP Server running on stdio");
 }
 
-const LOG_FILE = path.join(process.cwd(), "debug_error.log");
+const LOG_FILE = path.join(__dirname, "..", "debug_error.log");
 function logError(err: any) {
   const msg = `${new Date().toISOString()} - ${err instanceof Error ? err.stack : JSON.stringify(err)}\n`;
   fs.appendFileSync(LOG_FILE, msg);
