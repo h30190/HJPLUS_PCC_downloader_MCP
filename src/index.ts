@@ -57,11 +57,30 @@ class PccDownloader {
   private async searchAndWait(page: Page, keyword: string, chapter?: string) {
     await page.goto(this.url, { waitUntil: "networkidle" });
 
-    // 章節選擇（實際是 <select>，非 radio button）
+    // 章節選擇（實際是 <select id="tecCode">）
+    // 用三段式 fallback，避免 option value 格式不確定造成失敗：
+    // 1. 先嘗試 value 精確比對
+    // 2. 再嘗試 label 文字包含比對（「03 混凝土」裡找「03」）
+    // 3. 最後用 evaluate 直接設值並觸發 Vue change 事件
     if (chapter) {
       const select = page.locator("#tecCode");
       if (await select.count() > 0) {
-        await select.selectOption(chapter);
+        const selected = await select.selectOption(chapter).catch(() => null)
+          ?? await select.selectOption({ label: chapter }).catch(() => null)
+          ?? await page.evaluate((ch) => {
+            const sel = document.querySelector<HTMLSelectElement>("#tecCode");
+            if (!sel) return false;
+            const opt = Array.from(sel.options).find(
+              o => o.value.startsWith(ch) || o.text.startsWith(ch)
+            );
+            if (!opt) return false;
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          }, chapter).catch(() => null);
+        if (!selected) {
+          throw new Error(`找不到章節 "${chapter}"，請用 list_chapters 確認可用的章節代碼`);
+        }
       }
     }
 
@@ -86,12 +105,13 @@ class PccDownloader {
   /**
    * 取得下載按鈕的 Playwright selector
    *
-   * 實際調查：下載按鈕是 <button class="btn btn-link"> 含有 "DOC版"、"ODT版"、"ODS版" 等文字
-   * 注意：ODS 是 OpenDocument Spreadsheet（XLS 的 open format 替代）
+   * 實際調查：下載按鈕是 <button class="btn btn-link"> 含有 "DOC版"、"DOCX版"、"ODT版"、"ODS版" 等文字
+   * 注意：不同規範可能使用 DOC版 或 DOCX版，用逗號組合同時支援兩種
    */
   private getFormatSelector(format: string): string {
     switch (format.toLowerCase()) {
-      case "doc": return 'button.btn-link:has-text("DOC版")';
+      // 同時支援 "DOC版" 和 "DOCX版"（網站不同規範可能出現兩種）
+      case "doc": return 'button.btn-link:has-text("DOCX版"), button.btn-link:has-text("DOC版")';
       case "odt": return 'button.btn-link:has-text("ODT版")';
       case "xls": return 'button.btn-link:has-text("XLS版")';
       case "ods": return 'button.btn-link:has-text("ODS版")';
@@ -147,8 +167,8 @@ class PccDownloader {
             index,
             code: (tds[1] as HTMLElement)?.innerText?.trim() || "",
             name: (tds[2] as HTMLElement)?.innerText?.trim() || "",
-            fullVersion: (tds[3] as HTMLElement)?.innerText?.replace(/DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
-            detailVersion: (tds[4] as HTMLElement)?.innerText?.replace(/DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
+            fullVersion: (tds[3] as HTMLElement)?.innerText?.replace(/DOCX版|DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
+            detailVersion: (tds[4] as HTMLElement)?.innerText?.replace(/DOCX版|DOC版|ODT版|XLS版|ODS版|PDF版/g, "").trim() || "",
             hasDoc: btnTexts.some(t => t.includes("DOC")),
             hasOdt: btnTexts.some(t => t.includes("ODT")),
             hasXls: btnTexts.some(t => t.includes("XLS")),
