@@ -10,11 +10,12 @@ import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// 固定指向專案目錄下的 downloads，不受 agent 工作目錄影響
-const DOWNLOAD_DIR = path.join(__dirname, "..", "downloads");
+// 固定指向使用者的系統下載資料夾（C:\Users\{name}\Downloads）
+const DOWNLOAD_DIR = path.join(os.homedir(), "Downloads");
 
 // Ensure download directory exists
 if (!fs.existsSync(DOWNLOAD_DIR)) {
