@@ -8,10 +8,6 @@
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "repository": {
-    "type": "git",
-    "url": "http://192.168.0.125:3004/HJPLUS/PCC_downloader_MCP.git"
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",
